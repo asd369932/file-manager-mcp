@@ -18,6 +18,7 @@ import fnmatch
 import json
 import os
 import re
+import stat
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,33 @@ def _resolve(path: str) -> Path:
     return p
 
 
+def _hardlink_escape(p: Path) -> bool:
+    """检测'硬链接逃逸':文件在根目录内,但同一 inode 另有名字在根外。
+
+    resolve() 对硬链接无效(路径确实在根内,同一 inode 另有名字在根外)。
+    对抗性验证实测:根目录内预置的硬链接可穿透 read/search/write。
+
+    实现选择:直接拒绝 st_nlink > 1 的文件(O(1) per call)。
+    为什么不做"扫描根内找同 inode 的第二名字"的精确判定:那需要全树
+    遍历,search 场景会退化到 O(n²)。而根目录内合法使用硬链接的场景
+    极少(常见于备份/去重工具),用环境变量 MCP_ALLOW_HARDLINKS=1
+    可以关闭本检查。
+
+    前提说明:创建硬链接需要本地文件系统权限(内核 fs.protected_hardlinks
+    默认限制跨属主链接),所以现实风险集中在"根目录是共享/可写目录"的
+    部署;但静态检测成本低,默认开启。
+    """
+    if os.environ.get("MCP_ALLOW_HARDLINKS", "").strip() in ("1", "true", "True"):
+        return False
+    try:
+        st = p.stat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False  # 目录的 nlink 天然 ≥2(Unix 语义),不是硬链接逃逸
+    return st.st_nlink > 1
+
+
 def _fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -123,6 +151,8 @@ def read_file(path: str, offset: int = 1, limit: int = 0) -> str:
         f = _resolve(path)
     except PathError_ as e:
         return f"[拒绝] {e}"
+    if _hardlink_escape(f):
+        return "[拒绝] 文件存在根目录外的硬链接(可能绕过沙箱),已拦截。如确需访问设 MCP_ALLOW_HARDLINKS=1"
     if not f.exists():
         return f"[未找到] {f}"
     if f.is_dir():
@@ -159,6 +189,8 @@ def write_file(path: str, content: str, append: bool = False) -> str:
         f = _resolve(path)
     except PathError_ as e:
         return f"[拒绝] {e}"
+    if _hardlink_escape(f):
+        return "[拒绝] 文件存在根目录外的硬链接(可能绕过沙箱),已拦截。如确需访问设 MCP_ALLOW_HARDLINKS=1"
 
     data = content.encode("utf-8")
     if len(data) > MAX_WRITE_BYTES:
@@ -221,6 +253,10 @@ def search(path: str = ".", name_glob: str = "*", content_regex: str = "", max_r
             except OSError:
                 continue
             if not any(real == r or r in real.parents for r in _roots()):
+                skipped_escape += 1
+                continue
+            # 硬链接同样穿透 resolve —— 用 nlink 检测(实测可读走外部内容)
+            if _hardlink_escape(fp):
                 skipped_escape += 1
                 continue
 

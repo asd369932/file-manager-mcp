@@ -207,3 +207,52 @@ class TestSearch:
 
         out = json.loads(search(str(root), name_glob="inside-link*", content_regex="inside-content"))
         assert out["count"] == 1
+
+
+class TestHardlinkEscape:
+    """硬链接逃逸回归(复审发现的残留边界)。
+
+    对抗性验证实测:根内预置的硬链接可穿透 read/search/write ——
+    resolve() 对硬链接无效(路径真在根内)。修复:st_nlink>1 默认拒绝。
+    """
+
+    def _make_hardlink(self, root: Path, tmp_path: Path, content: str = "hardlink-secret"):
+        outside = tmp_path.parent / "hardlink-target.txt"
+        outside.write_text(content)
+        link = root / "hard.txt"
+        try:
+            os.link(outside, link)
+        except OSError:
+            pytest.skip("此环境不支持硬链接")
+        return outside, link
+
+    def test_read_via_hardlink_blocked(self, root: Path, tmp_path: Path) -> None:
+        _, link = self._make_hardlink(root, tmp_path)
+        out = read_file(str(link))
+        assert "hardlink-secret" not in out, f"硬链接读逃逸: {out[:100]}"
+        assert "[拒绝]" in out
+
+    def test_write_via_hardlink_blocked(self, root: Path, tmp_path: Path) -> None:
+        outside, link = self._make_hardlink(root, tmp_path, "ORIGINAL")
+        out = write_file(str(link), "OVERWRITTEN", append=True)
+        assert "[拒绝]" in out
+        assert outside.read_text() == "ORIGINAL", "外部文件被经硬链接改写"
+
+    def test_search_via_hardlink_blocked(self, root: Path, tmp_path: Path) -> None:
+        self._make_hardlink(root, tmp_path)
+        out = json.loads(search(str(root), name_glob="hard*", content_regex="hardlink-secret"))
+        assert out["count"] == 0, f"硬链接搜索逃逸: {out}"
+        assert out["escape_skipped"] >= 1
+
+    def test_allow_hardlinks_env_override(self, root: Path, tmp_path: Path,
+                                          monkeypatch: pytest.MonkeyPatch) -> None:
+        """MCP_ALLOW_HARDLINKS=1 时放行(逃生门可用)。"""
+        outside, link = self._make_hardlink(root, tmp_path, "ALLOWED-CONTENT")
+        monkeypatch.setenv("MCP_ALLOW_HARDLINKS", "1")
+        out = read_file(str(link))
+        assert "ALLOWED-CONTENT" in out
+
+    def test_normal_file_unaffected(self, root: Path) -> None:
+        """普通文件(nlink=1)不受影响。"""
+        out = read_file(str(root / "hello.txt"))
+        assert "line one" in out

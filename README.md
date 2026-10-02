@@ -25,9 +25,15 @@
 |------|------|
 | 根目录锁定 | `MCP_FILE_ROOT`(默认当前目录),所有操作先 resolve 再校验 |
 | 符号链接 | 解析后比对 —— 根目录内的软链指向根目录外时同样被拒(list/read/write/search 全部覆盖) |
+| 硬链接 | resolve 对硬链接无效(路径真在根内、inode 另有名字在根外)—— 用 `st_nlink > 1` 检测并拒绝;`MCP_ALLOW_HARDLINKS=1` 可关闭本检查 |
 | 读限制 | 单文件 1 MB / 2000 行;含 NUL 字节判定为二进制,不返回乱码 |
 | 写限制 | 单次 5 MB;可用 `MCP_WRITE_ENABLED=0` 一键关闭全部写操作 |
-| 搜索限制 | 最多 200 条结果;自动跳过 .git/node_modules/__pycache__/.venv;越界软链跳过并计数 |
+| 搜索限制 | 最多 200 条结果;自动跳过 .git/node_modules/__pycache__/.venv;越界软链/硬链跳过并计数 |
+
+硬链接那条是对抗性验证补充的:根目录内预置的硬链接(需本地文件系统权限,
+典型场景是"根目录为共享/可写目录")能穿透 read/search/write 三条路径,
+`resolve()` 对此无能为力。修复用 O(1) 的 nlink 检测;代价是根内合法的
+硬链接文件默认被拒,需要时用 `MCP_ALLOW_HARDLINKS=1` 放行。
 
 ## 安装
 
