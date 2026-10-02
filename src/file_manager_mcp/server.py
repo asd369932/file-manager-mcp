@@ -201,13 +201,29 @@ def search(path: str = ".", name_glob: str = "*", content_regex: str = "", max_r
     cap = max(1, min(int(max_results), MAX_SEARCH_RESULTS))
     hits: list[dict[str, Any]] = []
     skipped_binary = 0
+    skipped_escape = 0
 
     for root, dirs, files in os.walk(d):
-        dirs[:] = [x for x in dirs if x not in (".git", "node_modules", "__pycache__", ".venv")]
+        # 不跟随目录符号链接(默认行为),再显式过滤一次以防平台差异
+        dirs[:] = [x for x in dirs
+                   if x not in (".git", "node_modules", "__pycache__", ".venv")
+                   and not (Path(root) / x).is_symlink()]
         for name in files:
             if not fnmatch.fnmatch(name, name_glob):
                 continue
             fp = Path(root) / name
+
+            # 单个文件也要 resolve 后校验 —— os.walk 不跟随目录链接,
+            # 但【文件符号链接】会被直接读到。不校验就等于给根目录外的
+            # 文件开了一扇窗(实测:root 内 symlink → 外部 secret 被读走)。
+            try:
+                real = fp.resolve()
+            except OSError:
+                continue
+            if not any(real == r or r in real.parents for r in _roots()):
+                skipped_escape += 1
+                continue
+
             entry: dict[str, Any] = {"path": str(fp)}
             if rx is not None:
                 try:
@@ -228,11 +244,11 @@ def search(path: str = ".", name_glob: str = "*", content_regex: str = "", max_r
             hits.append(entry)
             if len(hits) >= cap:
                 out = {"count": len(hits), "truncated": True, "results": hits,
-                       "binary_skipped": skipped_binary}
+                       "binary_skipped": skipped_binary, "escape_skipped": skipped_escape}
                 return json.dumps(out, ensure_ascii=False, indent=2)
 
     out = {"count": len(hits), "truncated": False, "results": hits,
-           "binary_skipped": skipped_binary}
+           "binary_skipped": skipped_binary, "escape_skipped": skipped_escape}
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 

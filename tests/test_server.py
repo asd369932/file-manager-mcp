@@ -160,3 +160,50 @@ class TestSearch:
         out = json.loads(search(str(root), name_glob="*.txt", max_results=5))
         assert out["count"] == 5
         assert out["truncated"] is True
+
+    # ---- 回归测试:verify 子代理实测的 search 逃逸 ----
+
+    def test_search_does_not_follow_file_symlink_outside(self, root: Path, tmp_path: Path) -> None:
+        """search 不能通过文件符号链接读到根目录外的内容。
+
+        这是实测利用成功过的绕过:read_file/write_file 都 resolve 后校验,
+        但 search 直接 read_bytes,符号链接被原样读走。
+        """
+        outside = tmp_path.parent / "search-secret.txt"
+        outside.write_text("internal-token=SUPERSECRET123")
+        link = root / "link-to-secret.txt"
+        try:
+            os.symlink(outside, link)
+        except OSError:
+            pytest.skip("此环境不支持符号链接")
+
+        out = json.loads(search(str(root), name_glob="link-*", content_regex="SUPERSECRET"))
+        assert "SUPERSECRET" not in json.dumps(out, ensure_ascii=False), \
+            f"内容搜索经软链泄漏了外部文件: {out}"
+        assert out["escape_skipped"] >= 1
+
+    def test_search_name_only_also_skips_symlink(self, root: Path, tmp_path: Path) -> None:
+        """即使不做内容匹配,软链指到根目录外也不应出现在结果里。"""
+        outside = tmp_path.parent / "name-secret.txt"
+        outside.write_text("x")
+        link = root / "link2-secret.txt"
+        try:
+            os.symlink(outside, link)
+        except OSError:
+            pytest.skip("此环境不支持符号链接")
+
+        out = json.loads(search(str(root), name_glob="link2-*"))
+        assert not any("link2-secret" in r["path"] for r in out["results"])
+
+    def test_search_inside_symlink_still_works(self, root: Path) -> None:
+        """指向根目录【内】的软链应正常工作,不能被误杀。"""
+        target = root / "real-target.txt"
+        target.write_text("inside-content")
+        link = root / "inside-link.txt"
+        try:
+            os.symlink(target, link)
+        except OSError:
+            pytest.skip("此环境不支持符号链接")
+
+        out = json.loads(search(str(root), name_glob="inside-link*", content_regex="inside-content"))
+        assert out["count"] == 1
